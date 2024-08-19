@@ -1,0 +1,399 @@
+#include <ResponsiveAnalogRead.h>
+#include <MIDIUSB.h>
+
+//----------- Neopixel Values -----------//
+
+//FaderLED Values//
+#include <Adafruit_NeoPixel.h>
+#define fadeLedA_PIN 9
+#define fadeLedB_PIN 10
+#define fadeLed_COUNT 7
+
+Adafruit_NeoPixel fadeStripA(fadeLed_COUNT, fadeLedA_PIN, NEO_RGB + NEO_KHZ800);
+Adafruit_NeoPixel fadeStripB(fadeLed_COUNT, fadeLedB_PIN, NEO_RGB + NEO_KHZ800);
+uint32_t BACKGROUNDa = fadeStripA.Color(50, 20, 50);
+uint32_t BACKGROUNDb = fadeStripB.Color(50, 20, 50);
+uint32_t FILLa = fadeStripA.Color(0, 150, 0);
+uint32_t FILLb = fadeStripB.Color(0, 150, 0);
+
+//Backlight Values//
+#define backLed_PIN 11   //Declare pin for strip A
+#define backLed_COUNT 4  //Declare pixel count for strip A
+
+Adafruit_NeoPixel backStrip(backLed_COUNT, backLed_PIN, NEO_GRB + NEO_KHZ800);  //Declare Neopixel paramteters for strip A and establish as object
+uint32_t togBACK = backStrip.Color(150, 0, 0);
+uint32_t playBACK = backStrip.Color(0, 150, 0);
+uint32_t stingBACK = backStrip.Color(200, 80, 0);
+int lightSustain = 30;
+
+// Blink Cycle Values //
+long unsigned blinkTimer = 0;
+long unsigned blink = 0;
+bool red;
+
+//----------- Pot Values -----------//
+
+const int N_POTS = 3;                    //Declare how many pots are attached
+int PotPin[N_POTS] = { A0, A1, A2 };     //Declare where pots are attached
+int PotReading[N_POTS] = { 0 };          //Value to store analogue read of pot value
+int PotState[N_POTS] = { 0 };            //Value to store current state of pot
+int PotPState[N_POTS] = { 0 };           //Value to store last state of pot
+int MidiState[N_POTS] = { 0 };           //Value to store analogue range data (0-1023) as MIDI range data (0-128)
+int MidiPState[N_POTS] = { 0 };          //Value to record previous MIDI state for comparison
+const byte PotThreshold = 3;             //Set pot value change threshold to ignore noise and interference
+const int POT_TIMEOUT = 300;             //Set pot timer threshold
+unsigned long pPotTime[N_POTS] = { 0 };  //Value to store time since pot value was altered
+unsigned long PotTimer[N_POTS] = { 0 };  //Timer counting time since pot value was last altered
+
+//----------- Button Values -----------//
+
+//Digital Read Set (score & ambience toggles)
+const int N_BUTTONS = 10;                                       //Declare how many buttons are attached
+int ButtonPin[N_BUTTONS] = { 1, 2, 3, 4, 5, 6, 7, 8, 12, 13 };  //Declare where buttons are attached
+int ButtonState[N_BUTTONS] = { 0 };                             //Value to store current state of button
+int ButtonPState[N_BUTTONS] = { 0 };                            //Value to store last state of button
+const int BUTTON_TIMEOUT = 15;                                  //Set button timer threshold to ignore mechanical bouncing
+unsigned int ButtonDebounceTime[N_BUTTONS] = { 0 };             //Value to store time since button was last pressed
+unsigned int ButtonTimer[N_BUTTONS] = { 0 };                    //Timer counting time since button was last pressed
+
+//----------- MIDI Channel Declaration -----------//
+
+byte MIDI_CH = 0;  //Midi chanel used by device
+
+//MIDI instructions for pot signals
+int PotCC[N_POTS] = { 11, 12, 13 };  //Declare midi CC notes per pot
+
+//MIDI instructions for button signals
+int ButtonNN[N_BUTTONS] = { 36, 37, 38, 39, 40, 41, 42, 43, 44, 45 };  //Declare midi note number array per button
+
+//----------- Analog Smooth Values -----------//
+
+float SnapMultiplier = 0.01;                      //Analogue read smoothing vlaue: (0.0-1.0) Increase for faster but less smooth analogue readings
+ResponsiveAnalogRead ResponsivePot[N_POTS] = {};  //Assigns which ports analogue read smoother should be applied to
+
+//----------- Setup Function -----------//
+
+void setup() {
+
+  Serial.begin(9600);  //Intitialise serial printout
+
+  //----------- Setup for Neopixels -----------//
+
+  backStripSetup();
+  faderStripSetup();
+  StartupAnimation();
+
+  //----------- Setup Buttons -----------//
+
+  for (int i = 0; i < N_BUTTONS; i++) {   //For loop to assign below task to each button pin in array (prevents need to multiply task manually)
+    pinMode(ButtonPin[i], INPUT_PULLUP);  //Add pullup resistor to each digital pin that button is attached to
+  }
+  //----------- Setup Pots -----------//
+
+  for (int i = 0; i < N_POTS; i++) {                                   //For loop to assign below task to each pot in array (prevents need to multiply task manually)
+    ResponsivePot[i] = ResponsiveAnalogRead(0, true, SnapMultiplier);  //Initialise each instance of smoother
+    ResponsivePot[i].setAnalogResolution(1023);                        //Set resolution of analog read
+  }
+}
+
+//----------- Loop Function -----------//
+
+void loop() {
+
+  PotValChange();   //Call Pot Function
+  ButtonPress();    //Call Digital Button Function
+  backLightCues();  //Call Button Press Light Cue Function
+  fadeFollow();     //Call Fader Light Cue Function
+}
+
+//----------- MIDI Functions -----------//
+
+// Midi "Note On" Function MIDIUSB Library //
+
+void noteOn(byte channel, byte pitch, byte velocity) {
+  midiEventPacket_t noteOn = { 0x09, 0x90 | channel, pitch, velocity };
+  MidiUSB.sendMIDI(noteOn);
+}
+
+// MIDI "Note Off" Function MIDIUSB Library //
+
+void noteOff(byte channel, byte pitch, byte velocity) {
+  midiEventPacket_t noteOff = { 0x08, 0x80 | channel, pitch, velocity };
+  MidiUSB.sendMIDI(noteOff);
+}
+
+// MIDI CC control send Function MIDIUSB Library //
+
+void controlChange(byte channel, byte control, byte value) {
+  midiEventPacket_t event = { 0x0B, 0xB0 | channel, control, value };
+  MidiUSB.sendMIDI(event);
+}
+
+// Analog Pot Function //
+
+void PotValChange() {
+  for (int i = 0; i < N_POTS; i++) {                   //For loop to assign below task to each pot (prevents need to multiply task manually)
+    PotReading[i] = analogRead(PotPin[i]);             //Store analogue read integer as value "PotReading"
+    ResponsivePot[i].update(PotReading[i]);            //Use smoothing value to update the PotReading integer
+    PotState[i] = ResponsivePot[i].getValue();         //Get value for "PotState" from value of "PotReading" integer
+    MidiState[i] = map(PotState[i], 0, 1023, 0, 128);  //Convert range from analog voltage value range to MIDI value range and map values
+    int PotVar = abs(PotState[i] - PotPState[i]);      //Calculate pot variation: subtract current cycle state from previous cycle state
+    //Create value gate to allow recording of all steps in pot value change, whilst preventing noise in between intensional value changes:
+    if (PotVar > PotThreshold) {  //If variation is bigger than stated threshold
+      pPotTime[i] = millis();     //Then begin recording time to know how much time has passed since threshold was passed
+    }
+    PotTimer[i] = millis() - pPotTime[i];   //Store value of time passed since threshold opened as an integer named "PotTimer"
+    if (PotTimer[i] < POT_TIMEOUT) {        //If PotTimer Value is less than the declared pot timer threshold
+      if (MidiState[i] != MidiPState[i]) {  //Then wait for MIDI value to change
+        //Send Resulting Value as MIDI Data
+        controlChange(MIDI_CH, PotCC[i], MidiState[i]);
+        MidiUSB.flush();
+        //Serial print pot value readout
+        Serial.print("Pot ");
+        Serial.print(i);
+        Serial.print("  |  ");
+        Serial.print("PotState: ");
+        Serial.print(PotState[i]);
+        Serial.print(" - MidiState: ");
+        Serial.println(MidiState[i]);
+        //Record previous midi state as integer
+        MidiPState[i] = MidiState[i];
+      }
+      //Record previous pot state as integer
+      PotPState[i] = PotState[i];
+    }
+  }
+}
+
+// Digital Button Press Function //
+
+void ButtonPress() {
+  for (int i = 0; i < N_BUTTONS; i++) {                 //For loop to array button pins for N number of declared buttons
+    ButtonState[i] = digitalRead(ButtonPin[i]);         //Read voltage of button pin and store as "Button State"
+    ButtonTimer[i] = millis() - ButtonDebounceTime[i];  //Calculate how much time has passed since last button press
+    if (ButtonTimer[i] > BUTTON_TIMEOUT) {              //Continue after declared button timer threshold is passed
+      if (ButtonState[i] != ButtonPState[i]) {          //Continue if button is pressed or let go of
+        ButtonDebounceTime[i] = millis();               //Store time since button value last changed to "restart" button timer
+        if (ButtonState[i] == LOW)                      //If button is being depressed
+        {
+          noteOn(MIDI_CH, ButtonNN[i], 127);  //Then send data to declared MIDI USB channel, at MIDI note associated with button in array, at full velocity
+          MidiUSB.flush();                    //And clear MIDI channel after signal is sent
+                                              //Serial print button value readout
+          Serial.print("Button ");
+          Serial.print(i);
+          Serial.println(" = On");
+        } else {                            //Or if button is not being depresssed
+          noteOn(MIDI_CH, ButtonNN[i], 0);  //Then send data to declared MIDI USB channel, at MIDI note associated with button in array, at 0 velocity
+          MidiUSB.flush();                  //And clear MIDI channel after signal is sent
+                                            //Serial print button value readout
+          Serial.print("Button ");
+          Serial.print(i);
+          Serial.println(" = Off");
+        }
+        ButtonPState[i] = ButtonState[i];
+      }
+    }
+  }
+}
+
+//----------- LED Control Functions -----------//
+
+// Setup Functions for LEDs //
+
+void backStripSetup()  //Setup for backlight LEDs
+{
+  pinMode(backLed_PIN, OUTPUT);  //Set Backlight strip pin to output mode
+  backStrip.begin();             //INITIALIZE NeoPixel object
+  backStrip.show();              //Turn OFF all pixels ASAP
+  backStrip.setBrightness(200);  //Set brightness (max = 255)
+}
+void faderStripSetup()  //Setup for fader LED strips
+{
+  pinMode(fadeLedA_PIN, OUTPUT);  //Set stripA pin to output mode
+  pinMode(fadeLedB_PIN, OUTPUT);  //Set stripB pin to output mode
+  fadeStripA.begin();             //INITIALIZE NeoPixel object
+  fadeStripB.begin();             //INITIALIZE NeoPixel object
+  fadeStripA.setBrightness(100);  //Turn OFF all pixels ASAP
+  fadeStripB.setBrightness(100);  //Turn OFF all pixels ASAP
+  fadeStripA.clear();
+  fadeStripB.clear();
+}
+
+// Master Playlist Function for Startup Animations //
+
+void StartupAnimation()  //LED animation that plays on startup (program waits whilst animation plays)
+{
+  setFadersToColor(fadeStripA.Color(0, 0, 0));    //Play packaged fader animation
+  delay(200);                                     //Wait for 200ms
+  setBacklightToColor(backStrip.Color(0, 0, 0));  //Play packaged backight animation
+}
+
+// Startup Animation Master Function for Fader LED strips //
+
+void setFadersToColor(uint32_t color) {
+  for (int i = 0; i < fadeLed_COUNT; i++) {
+    fadeStripA.setPixelColor(i, fadeStripA.Color(150, 60, 150));
+    fadeStripA.setPixelColor(fadeLed_COUNT, fadeStripA.Color(150, 60, 150));
+    fadeStripA.show();
+    delay(200);
+  }
+  fadeStripA.show();
+  for (int i = 0; i < fadeLed_COUNT; i++) {
+    fadeStripB.setPixelColor(i, fadeStripB.Color(150, 60, 150));
+    fadeStripB.setPixelColor(fadeLed_COUNT, fadeStripB.Color(150, 60, 150));
+    fadeStripB.show();
+    delay(200);
+  }
+  fadeStripB.show();
+  for (uint8_t i = 0; i < fadeLed_COUNT; i++) {
+    fadeStripA.setPixelColor(i, fadeStripA.Color(0, 0, 0));
+    fadeStripB.setPixelColor(i, fadeStripB.Color(0, 0, 0));
+    fadeStripA.show();
+    fadeStripB.show();
+  }
+  delay(400);
+  for (int i = 0; i < fadeLed_COUNT; i++) {
+    fadeStripA.setPixelColor(i, fadeStripA.Color(0, 150, 0));
+    fadeStripA.setPixelColor(fadeLed_COUNT, fadeStripA.Color(0, 150, 0));
+    fadeStripB.setPixelColor(i, fadeStripB.Color(0, 150, 0));
+    fadeStripB.setPixelColor(fadeLed_COUNT, fadeStripB.Color(0, 150, 0));
+    fadeStripA.show();
+    fadeStripB.show();
+    delay(200);
+  }
+}
+
+// Startup Animation Function for Backlight LED strip //
+
+void setBacklightToColor(uint32_t color)  //Backlight Startup Animation
+{
+  for (int i = 0; i < backLed_COUNT; i++) {
+    backStrip.setPixelColor(i, backStrip.Color(60, 150, 150));
+    backStrip.setPixelColor(backLed_COUNT, backStrip.Color(60, 150, 150));
+    backStrip.show();
+    delay(400);
+  }
+  backStrip.show();
+}
+
+// Conditions and Instructions for Backlight LEDs during runtime //
+
+void backLightCues()  //Triggers for backlight cues
+{
+  blinkTimer = millis();  //Start Blink Time regulator
+  int iA = MidiPState[0];
+  iA = map(iA, 0, 126, 150, 1);
+  uint32_t atmosBACK = backStrip.Color(0, iA, 150);
+  uint32_t defaultBACK = backStrip.Color(iA, 150, 150);
+
+  for (int i = 0; i < N_BUTTONS; i++) {
+    if (ButtonState[0] == LOW)  //Button Press 1
+    {
+      backStrip.fill(togBACK, 0, backLed_COUNT);
+      backStrip.show();
+      delay(lightSustain);
+    } else if (ButtonState[1] == LOW)  //Button Press 2
+    {
+      backStrip.fill(togBACK, 0, backLed_COUNT);
+      backStrip.show();
+      delay(lightSustain);
+    } else if (ButtonState[2] == LOW)  //Button Press 3
+    {
+      backStrip.fill(togBACK, 0, backLed_COUNT);
+      backStrip.show();
+      delay(lightSustain);
+    } else if (ButtonState[3] == LOW)  //Button Press 4
+    {
+      backStrip.fill(togBACK, 0, backLed_COUNT);
+      backStrip.show();
+      delay(lightSustain);
+    } else if (ButtonState[4] == LOW)  //Button Press 5
+    {
+      backStrip.fill(atmosBACK, 0, backLed_COUNT);
+      backStrip.show();
+      delay(lightSustain);
+    } else if (ButtonState[5] == LOW)  //Button Press 6
+    {
+      backStrip.fill(atmosBACK, 0, backLed_COUNT);
+      backStrip.show();
+      delay(lightSustain);
+    } else if (ButtonState[6] == LOW)  //Button Press 7
+    {
+      backStrip.fill(atmosBACK, 0, backLed_COUNT);
+      backStrip.show();
+      delay(lightSustain);
+    } else if (ButtonState[7] == LOW)  //Play Button Press
+    {
+      backStrip.fill(playBACK, 0, backLed_COUNT);
+      backStrip.show();
+      delay(lightSustain);
+    } else if (ButtonState[8] == LOW)  //Stng Button Press
+    {
+      backStrip.fill(stingBACK, 0, backLed_COUNT);
+      backStrip.show();
+      delay(lightSustain);
+    } else if (ButtonState[9] == LOW)  //Focus Button Hold Blink
+    {
+      {
+        if (blinkTimer > blink) {
+          blink += 150;
+          red = !red;
+          backStrip.setPixelColor(0, red * 150, 0, red * 150);
+          backStrip.setPixelColor(1, red * 150, 0, red * 150);
+          backStrip.setPixelColor(2, red * 150, 0, red * 150);
+          backStrip.setPixelColor(3, red * 150, 0, red * 150);
+          backStrip.show();
+        }
+      }
+    } else if (ButtonState[i] == HIGH)  //No Button Press
+    {
+      backStrip.fill(defaultBACK, 0, backLed_COUNT);
+      backStrip.show();
+    }
+  }
+}
+
+// Conditions and Instructions for Fader LEDs during runtime //
+
+void fadeFollow() {
+  int iBred = MidiPState[1];  //Take MIDI data state from potentiometer array
+  //iteration 1 (volume slider) and store as integer
+  int iBgreen = MidiPState[1];  //Take MIDI data state from potentiometer array
+  //iteration 1 (volume slider) and store as integer
+  int iCred = MidiPState[2];  //Take MIDI data state from potentiometer array
+  //iteration 2 (vibe slider) and store as integer
+  int iCgreen = MidiPState[2];  //Take MIDI data state from potentiometer
+  //array iteration 2 (vibe slider) and store as integer
+  iBred = map(iBred, 0, 126, 150, 1);  //Map MIDI data range to neopixel red
+  //colour range for strip A (must never be 0) and update integer
+  iBgreen = map(iBgreen, 0, 126, 1, 150);  //Map MIDI data range to neopixel
+  //green colour range for strip A (must never be 0) and update integer
+  iCred = map(iCred, 0, 126, 150, 1);  //Map MIDI data range to neopixel red
+  //colour range for strip B (must never be 0) and update integer
+  iCgreen = map(iCgreen, 0, 126, 1, 150);  //Map MIDI data range to neopixel
+  //green colour range for strip B (must never be 0) and update integer
+  uint32_t FILLa = fadeStripA.Color(iBred, iBgreen, 0);  //Define colour
+  //pallette for strip A fill area with new mapped integers
+  uint32_t FILLb = fadeStripB.Color(iCred, iCgreen, 0);  //Define colour
+  //pallette for strip B fill area with new mapped integers
+  int iD = MidiPState[1];  //Take MIDI data state from potentiometer array
+  //iteration 1 (volume slider) and store as integer
+  int iE = MidiPState[2];  //Take MIDI data state from potentiometer array
+  //iteration 2 (vibe slider) and store as integer
+  iD = map(iD, 0, 126, 1, fadeLed_COUNT);  //Map MIDI data range to neopixel
+  //pixel count (must never be 0) and update integer to follow fader position
+  iE = map(iE, 0, 126, 1, fadeLed_COUNT);  //Map MIDI data range to neopixel
+  //pixel count (must never be 0) and update integer to follow fader position
+  fadeStripA.clear();             //Clear/reset previous cycle data for strip A
+  fadeStripB.clear();             //Clear/reset previous cycle data for strip B
+  fadeStripA.fill(FILLa, 0, iD);  //Set colour for slider moves from 0 to
+  //slider position
+  fadeStripB.fill(FILLb, 0, iE);  //Set colour for slider moves from 0 to
+  //slider position
+  fadeStripA.fill(BACKGROUNDa, iD, fadeLed_COUNT);  //Set colour for LED strip
+  //moves from slider position to maximum pixel number
+  fadeStripB.fill(BACKGROUNDb, iE, fadeLed_COUNT);  //Set colour for LED strip
+  //moves from slider position to maximum pixel number
+  fadeStripA.show();  //Update strip A with new display setting
+  fadeStripB.show();  //Update strip B with new display setting
+}
